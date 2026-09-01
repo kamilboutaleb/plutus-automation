@@ -38,9 +38,10 @@ patterns, filters to investor roles only, ranks by seniority.
 
     .venv/bin/pip install playwright && .venv/bin/playwright install chromium
     export ROCKETREACH_EMAIL="you@example.com"
-    export ROCKETREACH_PASSWORD="your_password"
+    read -s "ROCKETREACH_PASSWORD?RocketReach password: "; export ROCKETREACH_PASSWORD; echo
     .venv/bin/python rocketreach_web.py --input <file>.xlsx            # real run
     .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful  # watch + finish 2FA
+    .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful --timeout 300
     .venv/bin/python rocketreach_web.py --input <file>.xlsx --plan     # plan only, no login
 
 Logs into RocketReach, resolves each firm via the company search (domain,
@@ -61,6 +62,16 @@ occasionally ask for manual verification.
 > account's lookup credits when you reveal emails ("Get Contact Info"), and
 > automation of the site may violate RocketReach's terms of service. Run
 > responsibly and at modest delay (default 1s between requests).
+
+After a successful login, the browser authentication state is saved to
+`.rocketreach-auth.json` and reused on later runs. This avoids presenting
+RocketReach with a completely new session every time. The file contains
+sensitive session cookies, is excluded by `.gitignore`, and is created with
+owner-only permissions. Use `--fresh-login` to ignore it when it expires or
+when you intentionally change accounts. CAPTCHA and emailed-code verification
+remain manual in `--headful` mode; the script only waits for completion. The
+default login timeout is 15 seconds; use `--timeout 300` when manual
+verification needs longer.
 
 ## What all pipelines enforce
 
@@ -90,4 +101,3 @@ contact, no email available — kept for manual follow-up), `no_match`.
 - RR endpoint paths are constants at the top of `auto_enrich.py`.
 - Website crawling respects same-domain boundaries and rate-limits itself;
   review robots.txt of target sites for compliance-sensitive use.
-
