@@ -2,7 +2,8 @@ import re
 
 ALLOWED_TITLE_RE = re.compile(
     r"\b(partner|principal|associate|investment manager|investment team|"
-    r"venture partner|managing partner|general partner|founding partner)\b",
+    r"venture partner|managing partner|general partner|founding partner|"
+    r"managing director|venture capitalist|investor|investment professional)\b",
     re.I,
 )
 
@@ -10,17 +11,18 @@ EXCLUDE_TITLE_WORDS = [
     "analyst", "intern", "operations", "finance", "financial", "legal",
     "counsel", "compliance", "marketing", "talent", "platform", "recruiter",
     "recruiting", "chief of staff", "assistant", "office manager",
-    "controller", "accounting", "communications", "founder", "co-founder",
-    "ceo", "cto", "engineer", "developer", "designer",
+    "controller", "accounting", "communications", "engineer", "developer",
+    "designer",
 ]
 
 PRIORITY_PATTERNS = [
     (r"\bmanaging partner\b|\bgeneral partner\b|\bfounding partner\b", 1),
-    (r"\bpartner\b|\bventure partner\b", 2),
+    (r"\bpartner\b|\bventure partner\b|\bmanaging director\b", 2),
     (r"\bprincipal\b", 3),
     (r"\binvestment manager\b", 4),
     (r"\binvestment team\b", 5),
     (r"\bsenior associate\b|\binvestment associate\b|\bassociate\b", 6),
+    (r"\binvestor\b|\binvestment professional\b|\bventure capitalist\b", 6),
 ]
 
 PRIORITY_LABEL = {

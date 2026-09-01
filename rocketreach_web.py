@@ -28,6 +28,11 @@ LOGIN_URL = "https://rocketreach.co/login"
 COMPANY_URL = "https://rocketreach.co/company"
 PERSON_URL = "https://rocketreach.co/person"
 
+# People-search paging. Title reads are free, so the scan window is much
+# wider than the credited email-reveal cap (MAX_CONTACTS_PER_FIRM).
+SCAN_PAGE_SIZE = 10
+MAX_SCAN_CARDS = 30
+
 # Selectors are centralised here because RocketReach's DOM is not a public,
 # stable API. They were verified against the live site when this file was
 # written; if RocketReach changes their markup, adjust ONLY this block.
@@ -72,6 +77,14 @@ def extract_card(page, card):
     """Extract name/title/employer/email from one result card element."""
     name = _text(card.locator(SEL["card_name"]).first) or ""
     title = _text(card.locator(SEL["card_title"]).first) or ""
+    if not title:
+        # Fallback: last non-empty paragraph on the card is usually the
+        # current title when the primary class combo is absent.
+        for p in card.locator("p").all():
+            t = _text(p)
+            if t and t != name:
+                title = t
+                break
     emp = _text(card.locator(SEL["card_employer"]).first) or ""
     email = ""
     email_links = card.locator("a[data-testid='email-phone-text-desktop'], "
@@ -90,10 +103,10 @@ def extract_card(page, card):
     }
 
 
-def enrich_firm(page, firm, headful, delay):
+def enrich_firm(page, firm, headful, delay, debug=False):
     result_rows = []
     try:
-        candidates, note = find_candidates(page, firm, headful, delay)
+        candidates, note = find_candidates(page, firm, headful, delay, debug=debug)
     except RuntimeError as e:
         return [], "api_error", str(e)
 
@@ -178,41 +191,111 @@ def pg_title_ok(page):
     return "just a moment" not in title and title != ""
 
 
-def find_candidates(page, firm, headful, delay):
-    """Resolve the firm to a people-search URL and return ranked candidates."""
-    person_url, note = _person_url_for_company(page, firm, headful, delay)
-    if not person_url:
-        return [], note or "no people search URL for firm"
+def _advance_page_start(url, step):
+    """Return the same /person URL with its `start` param moved by `step`."""
+    u = urllib.parse.urlparse(url)
+    q = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+    try:
+        cur = 1
+        for k, v in q:
+            if k == "start":
+                cur = int(v)
+                break
+    except (TypeError, ValueError):
+        cur = 1
+    new = []
+    had = False
+    for k, v in q:
+        if k == "start":
+            v = str(cur + step)
+            had = True
+        new.append((k, v))
+    if not had:
+        new.append(("start", str(cur + step)))
+    return urllib.parse.urlunparse(
+        u._replace(query=urllib.parse.urlencode(new))
+    )
 
-    page.goto(person_url, wait_until="domcontentloaded")
+
+def _open_results(page, url, delay):
+    page.goto(url, wait_until="domcontentloaded")
     for _ in range(8):
         time.sleep(delay + 2.0)
         if pg_title_ok(page):
             break
-
-    cards = page.locator(SEL["result_card"])
     try:
-        cards.first.wait_for(state="visible", timeout=30000)
+        page.locator(SEL["result_card"]).first.wait_for(
+            state="visible", timeout=30000
+        )
     except Exception:
-        return [], "no people found for firm on RocketReach"
+        pass
+
+
+def find_candidates(page, firm, headful, delay, debug=False):
+    """Resolve the firm to a people-search URL and return ranked candidates.
+
+    Title reads are free (only email reveals consume credits), so card
+    scanning is widened well beyond the MAX_CONTACTS_PER_FIRM credit cap:
+    up to MAX_SCAN_CARDS cards across result pages are examined. With
+    `debug` enabled the per-card verdict (name/title/allowed/reason) is
+    printed so a "no_match" firm is self-explanatory.
+    """
+    person_url, note = _person_url_for_company(page, firm, headful, delay)
+    if not person_url:
+        return [], note or "no people search URL for firm"
 
     cands = []
-    n = min(cards.count(), MAX_CONTACTS_PER_FIRM * 2)
-    for i in range(n):
-        card = cards.nth(i)
-        data = extract_card(page, card)
-        title = clean_text(data["current_title"])
-        if not title_allowed(title):
-            continue
-        prio = title_priority(title)
-        if prio is None:
-            continue
-        data["prio"] = prio
-        data["card"] = card
-        data["employer_domain"] = normalize_domain(
-            data["current_employer"] or ""
-        )
-        cands.append(data)
+    scanned = 0
+    offset = 1
+    first_page = True
+    while scanned < MAX_SCAN_CARDS:
+        url = person_url if offset == 1 else _advance_page_start(person_url, offset - 1)
+        _open_results(page, url, delay)
+        cards = page.locator(SEL["result_card"])
+        count = cards.count()
+        if first_page and count == 0:
+            return [], "no people found for firm on RocketReach"
+        first_page = False
+
+        for i in range(min(count, SCAN_PAGE_SIZE)):
+            if scanned >= MAX_SCAN_CARDS:
+                break
+            card = cards.nth(i)
+            data = extract_card(page, card)
+            title = clean_text(data["current_title"])
+            allowed = bool(title and title_allowed(title))
+            reason = ""
+            prio = None
+            if allowed:
+                prio = title_priority(title)
+                if prio is None:
+                    allowed = False
+                    reason = "priority unmapped"
+            elif not title:
+                reason = "no title"
+            else:
+                reason = "role not matched"
+            if debug:
+                verdict = "OK" if allowed else "--"
+                name = data["name"][:26] or "?"
+                print(f"      [{scanned + 1:3d}] {verdict} {name:<26} "
+                      f"{title[:46]:<46} {reason}")
+            scanned += 1
+            if not allowed:
+                continue
+            data["prio"] = prio
+            data["card"] = card
+            data["employer_domain"] = normalize_domain(
+                data["current_employer"] or ""
+            )
+            cands.append(data)
+
+        if count < SCAN_PAGE_SIZE or scanned >= MAX_SCAN_CARDS:
+            break
+        offset += SCAN_PAGE_SIZE
+
+    if debug:
+        print(f"      scanned {scanned} cards, {len(cands)} role-matching")
     cands.sort(key=lambda c: c["prio"])
     return cands, "no role-matching people on RocketReach"
 
@@ -388,7 +471,9 @@ def run(args):
         for i, firm in enumerate(firms, 1):
             label = firm["vc_name"] or firm["normalized_domain"]
             print(f"[{i}/{len(firms)}] {label}")
-            rows, status, note = enrich_firm(page, firm, args.headful, args.delay)
+            rows, status, note = enrich_firm(
+                page, firm, args.headful, args.delay, debug=args.debug
+            )
             if status == "api_error":
                 print(f"    ERROR: {note}")
                 continue
@@ -437,6 +522,8 @@ def main():
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
     ap.add_argument("--plan", action="store_true",
                     help="print the plan and exit (no login/browser)")
+    ap.add_argument("--debug", action="store_true",
+                    help="print per-card scan verdicts while searching firms")
     ap.add_argument("--dump-selectors", action="store_true",
                     help="login and print live page structure to calibrate "
                          "the SEL config, then exit")

@@ -41,7 +41,7 @@ REVEALS = {
 }
 
 
-def fake_find(page, firm, headful, delay):
+def fake_find(page, firm, headful, delay, debug=False):
     if firm["normalized_domain"] == "acme.vc":
         key = "acme.vc"
     elif firm["vc_name"].startswith("Beta"):
@@ -106,6 +106,7 @@ class FakeArgs:
     delay = 0.0
     headful = False
     plan = False
+    debug = False
 
 
 rw.run(args=FakeArgs())
