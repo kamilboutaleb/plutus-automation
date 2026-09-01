@@ -1,14 +1,19 @@
 # VC Workbook Enrichment
 
-Two independent pipelines, both fully automated:
+Three independent pipelines, all fully automated:
 
 1. **`auto_enrich.py`** — official RocketReach API (needs `ROCKETREACH_API_KEY`)
 2. **`website_enrich.py`** — crawls each VC's own website team pages (no API,
    no account, no credits)
+3. **`rocketreach_web.py`** — drives RocketReach in a real browser via
+   Playwright, logging in with your account and scraping the People Search UI
+   (no API key)
 
 Both take the same input workbook (`vc_name`, `website` filled) and produce
 the same output format: up to 3 role-verified investor contacts per firm,
 best-ranked first, with full helper columns.
+
+All three enforce the same behavioral rules (below).
 
 ## Quick start
 
@@ -29,7 +34,35 @@ team/about/people hints, configurable delay). Extracts names + titles from
 team pages, captures mailto links and de-obfuscates `name [at] domain`
 patterns, filters to investor roles only, ranks by seniority.
 
-## What both pipelines enforce
+### Option 3: RocketReach via browser (Playwright)
+
+    .venv/bin/pip install playwright && .venv/bin/playwright install chromium
+    export ROCKETREACH_EMAIL="you@example.com"
+    export ROCKETREACH_PASSWORD="your_password"
+    .venv/bin/python rocketreach_web.py --input <file>.xlsx            # real run
+    .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful  # watch + finish 2FA
+    .venv/bin/python rocketreach_web.py --input <file>.xlsx --plan     # plan only, no login
+
+Logs into RocketReach, resolves each firm via the company search (domain,
+else firm name), follows "Search Employees" to the people-search results,
+applies the investor-title filter, then clicks "Get Contact Info" on the top
+role-ranked candidates to reveal and capture emails. `--headful` keeps the
+browser visible — **recommended, often required** because RocketReach sits
+behind a Cloudflare challenge that blocks headless/automated browsers and may
+occasionally ask for manual verification.
+
+> **Calibrating selectors after a RocketReach redesign:** RocketReach's page
+> markup is not a public, stable API. If the scraper stops finding data, run
+>     .venv/bin/python rocketreach_web.py --input <file>.xlsx --dump-selectors --headful
+> to print the live page structure, then update the `SEL` dict at the top of
+> `rocketreach_web.py`.
+
+> **Note:** this skips the API and scrapes the web UI. It still uses your
+> account's lookup credits when you reveal emails ("Get Contact Info"), and
+> automation of the site may violate RocketReach's terms of service. Run
+> responsibly and at modest delay (default 1s between requests).
+
+## What all pipelines enforce
 
 - Roles kept: managing/general/founding partner, partner, venture partner,
   principal, investment manager, investment team, senior/investment associate
@@ -50,6 +83,7 @@ contact, no email available — kept for manual follow-up), `no_match`.
 
     .venv/bin/python mock_test.py            # API pipeline
     .venv/bin/python mock_test_website.py    # website pipeline
+    .venv/bin/python mock_test_rrweb.py      # RocketReach web pipeline
 
 ## Notes
 
