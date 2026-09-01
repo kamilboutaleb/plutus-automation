@@ -32,14 +32,18 @@ PERSON_URL = "https://rocketreach.co/person"
 # wider than the credited email-reveal cap (MAX_CONTACTS_PER_FIRM).
 SCAN_PAGE_SIZE = 10
 MAX_SCAN_CARDS = 30
+DEFAULT_LOGIN_TIMEOUT = 15
 
 # Selectors are centralised here because RocketReach's DOM is not a public,
 # stable API. They were verified against the live site when this file was
 # written; if RocketReach changes their markup, adjust ONLY this block.
 SEL = {
-    "login_email": "input[name='email']",
-    "login_password": "input[name='password']",
-    "login_submit": "button[type='submit']:has-text('log in')",
+    "login_email": "input[name='email'], input[type='email'], "
+                   "input[autocomplete='username']",
+    "login_password": "input[name='password'], input[type='password']",
+    "login_submit": "button[type='submit']:has-text('log in'), "
+                    "button[type='submit']:has-text('sign in'), "
+                    "button:has-text('continue')",
     # After login the nav shows the dashboard. Used as a logged-in sentinel.
     "logged_in_marker": "a[href='/dashboard'], "
                         "a[href='/search'], "
@@ -65,6 +69,21 @@ SEL = {
                      "button:has-text('Get Email'), "
                      "button:has-text('Lookup')",
 }
+
+AUTHENTICATED_PATHS = ("/dashboard", "/search", "/company", "/person")
+AUTH_PATHS = ("/login", "/sign-in", "/signin", "/auth", "/verify")
+OTP_SIGNS = (
+    "verification code", "enter the code", "check your email",
+    "verify your identity", "one-time code", "security code",
+)
+CHALLENGE_SIGNS = (
+    "just a moment", "verify you are human", "checking your browser",
+    "captcha", "cloudflare",
+)
+BAD_CREDENTIAL_SIGNS = (
+    "incorrect email", "incorrect password", "invalid credentials",
+    "email or password is incorrect", "wrong password",
+)
 
 
 def _text(el):
@@ -336,21 +355,138 @@ def reveal_email(page, card, headful):
     return ""
 
 
-def login(page, email, password, headful, timeout=120):
+def _visible(locator):
+    try:
+        return locator.count() > 0 and locator.is_visible()
+    except Exception:
+        return False
+
+
+def _page_summary(page):
+    try:
+        return clean_text(page.title()), page.url
+    except Exception:
+        return "", ""
+
+
+def _body_text(page, limit=1200):
+    try:
+        return clean_text(page.locator("body").inner_text(timeout=3000))[:limit]
+    except Exception:
+        return ""
+
+
+def _is_logged_in(page):
+    """Recognise a valid session without depending on one fragile nav selector."""
+    try:
+        if _visible(page.locator(SEL["logged_in_marker"]).first):
+            return True
+    except Exception:
+        pass
+
+    title, url = _page_summary(page)
+    if any(sign in title.lower() for sign in CHALLENGE_SIGNS):
+        return False
+    try:
+        if _visible(page.locator(SEL["login_password"]).first):
+            return False
+    except Exception:
+        pass
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "/").lower().rstrip("/") or "/"
+    except Exception:
+        return False
+    if host != "rocketreach.co" and not host.endswith(".rocketreach.co"):
+        return False
+    if any(path == p or path.startswith(f"{p}/") for p in AUTH_PATHS):
+        return False
+    return any(path == p or path.startswith(f"{p}/")
+               for p in AUTHENTICATED_PATHS)
+
+
+def _login_blocker(page):
+    """Return a useful diagnosis; never attempts to solve a challenge."""
+    title, _ = _page_summary(page)
+    body = _body_text(page).lower()
+    combined = f"{title.lower()} {body}"
+    if any(sign in combined for sign in BAD_CREDENTIAL_SIGNS):
+        return "RocketReach rejected the email or password"
+    if any(sign in combined for sign in OTP_SIGNS):
+        return "RocketReach is waiting for an emailed verification code"
+    if any(sign in combined for sign in CHALLENGE_SIGNS):
+        return "a Cloudflare/CAPTCHA challenge is still open"
+    if _visible(page.locator(SEL["login_password"]).first):
+        return "the login form is still visible"
+    return "RocketReach did not expose a recognised signed-in page"
+
+
+def _failure_message(page, prefix):
+    title, url = _page_summary(page)
+    return (f"{prefix}: {_login_blocker(page)}. Final page: "
+            f"{url or '?'} (title: {title or '?'}).")
+
+
+def _saved_session_is_valid(page, timeout=20):
+    try:
+        page.goto(PERSON_URL, wait_until="domcontentloaded")
+    except Exception:
+        return False
+    deadline = time.time() + min(max(timeout, 1), 20)
+    while time.time() < deadline:
+        if _is_logged_in(page):
+            return True
+        _, url = _page_summary(page)
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+        except Exception:
+            path = ""
+        if any(path == p or path.startswith(f"{p}/") for p in AUTH_PATHS):
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def _save_session(context, path):
+    if not path:
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    context.storage_state(path=path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def login(page, email, password, headful, timeout=DEFAULT_LOGIN_TIMEOUT):
     if not email or not password:
         raise RuntimeError("set ROCKETREACH_EMAIL/ROCKETREACH_PASSWORD "
                            "or pass --email/--password")
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    if _is_logged_in(page):
+        return
     # Wait out any Cloudflare "Just a moment" challenge before the form shows.
     em = page.locator(SEL["login_email"]).first
     deadline = time.time() + timeout
+    form_ready = False
+    last_report = 0.0
     while time.time() < deadline:
-        try:
-            if em.count() > 0 and em.is_visible():
-                break
-        except Exception:
-            pass
+        if _is_logged_in(page):
+            return
+        if _visible(em):
+            form_ready = True
+            break
+        now = time.time()
+        if headful and now - last_report >= 15:
+            last_report = now
+            print(f"    waiting for login form — {_login_blocker(page)}…")
         time.sleep(1.0)
+    if not form_ready:
+        raise RuntimeError(_failure_message(
+            page, "login form did not become available"
+        ))
     em.fill(email)
     pw = page.locator(SEL["login_password"]).first
     pw.fill(password)
@@ -359,24 +495,31 @@ def login(page, email, password, headful, timeout=120):
     except Exception:
         pw.press("Enter")
     if headful:
-        # Give the user a chance to complete 2FA / CAPTCHA manually.
-        print("  headful mode: complete any 2FA/CAPTCHA manually…")
-    marker = SEL["logged_in_marker"]
+        print("  login submitted — complete any CAPTCHA or emailed code "
+              "manually in the browser; the script will continue "
+              "automatically after verification…")
     deadline = time.time() + timeout
+    last_report = 0.0
     while time.time() < deadline:
-        try:
-            if page.locator(marker).first.count() > 0 and \
-               page.locator(marker).first.is_visible():
-                return
-        except Exception:
-            pass
+        if _is_logged_in(page):
+            return
+        blocker = _login_blocker(page)
+        if blocker == "RocketReach rejected the email or password":
+            raise RuntimeError(_failure_message(page, "login failed"))
+        now = time.time()
+        if headful and now - last_report >= 15:
+            last_report = now
+            print(f"    still waiting — {blocker}…")
         time.sleep(1.0)
-    raise RuntimeError("login did not complete (2FA/CAPTCHA, Cloudflare "
-                       "challenge, or wrong credentials); run with --headful "
-                       "to complete any verification manually")
+    # The site may redirect to a newly named landing route after login. Probe a
+    # known authenticated route once before declaring failure.
+    if _saved_session_is_valid(page, timeout=min(timeout, 20)):
+        return
+    raise RuntimeError(_failure_message(page, "login timed out"))
 
 
-def dump_selectors(email, password, headful, timeout=120):
+def dump_selectors(email, password, headful,
+                   timeout=DEFAULT_LOGIN_TIMEOUT):
     """Navigate the live site and print its structure to discover selectors."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headful)
@@ -463,34 +606,63 @@ def run(args):
     no_matches = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headful)
-        ctx = browser.new_context()
+        session_file = str(getattr(args, "session_file", "") or "").strip()
+        fresh_login = bool(getattr(args, "fresh_login", False))
+        use_saved = bool(session_file and os.path.isfile(session_file)
+                         and not fresh_login)
+        context_options = {"storage_state": session_file} if use_saved else {}
+        try:
+            ctx = browser.new_context(**context_options)
+        except Exception as exc:
+            if not use_saved:
+                raise
+            print(f"saved session could not be loaded ({exc}); logging in again")
+            use_saved = False
+            ctx = browser.new_context()
         page = ctx.new_page()
-        print("logging in…")
-        login(page, email, password, args.headful, timeout=args.timeout)
-        print("logged in")
-        for i, firm in enumerate(firms, 1):
-            label = firm["vc_name"] or firm["normalized_domain"]
-            print(f"[{i}/{len(firms)}] {label}")
-            rows, status, note = enrich_firm(
-                page, firm, args.headful, args.delay, debug=args.debug
-            )
-            if status == "api_error":
-                print(f"    ERROR: {note}")
-                continue
-            if status == "no_match":
-                no_matches.append({
-                    "vc_name": firm["vc_name"], "website": firm["website"],
-                    "normalized_domain": firm["normalized_domain"],
-                    "lookup_status": "no_match", "notes": note,
-                })
-                print(f"    no_match ({note})")
-                continue
-            for r in rows:
-                print(f"    {r['contact_priority']:<18} "
-                      f"{r['first_name']} {r['last_name']} "
-                      f"<{r['primary_email'] or '-'}>")
-            all_rows.extend(rows)
-        browser.close()
+        try:
+            authenticated = False
+            if use_saved:
+                print(f"checking saved RocketReach session: {session_file}")
+                authenticated = _saved_session_is_valid(page, args.timeout)
+                if authenticated:
+                    print("using saved RocketReach session")
+                else:
+                    print("saved RocketReach session expired; logging in again")
+            if not authenticated:
+                print("logging in…")
+                login(page, email, password, args.headful,
+                      timeout=args.timeout)
+                print("logged in")
+            if session_file:
+                _save_session(ctx, session_file)
+                print(f"saved RocketReach session: {session_file}")
+
+            for i, firm in enumerate(firms, 1):
+                label = firm["vc_name"] or firm["normalized_domain"]
+                print(f"[{i}/{len(firms)}] {label}")
+                rows, status, note = enrich_firm(
+                    page, firm, args.headful, args.delay, debug=args.debug
+                )
+                if status == "api_error":
+                    print(f"    ERROR: {note}")
+                    continue
+                if status == "no_match":
+                    no_matches.append({
+                        "vc_name": firm["vc_name"], "website": firm["website"],
+                        "normalized_domain": firm["normalized_domain"],
+                        "lookup_status": "no_match", "notes": note,
+                    })
+                    print(f"    no_match ({note})")
+                    continue
+                for r in rows:
+                    print(f"    {r['contact_priority']:<18} "
+                          f"{r['first_name']} {r['last_name']} "
+                          f"<{r['primary_email'] or '-'}>")
+                all_rows.extend(rows)
+        finally:
+            ctx.close()
+            browser.close()
 
     out = pd.DataFrame(all_rows, columns=FINAL_COLS)
     order = {v: k for k, v in PRIORITY_LABEL.items()}
@@ -522,8 +694,14 @@ def main():
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
     ap.add_argument("--plan", action="store_true",
                     help="print the plan and exit (no login/browser)")
-    ap.add_argument("--timeout", type=int, default=120,
-                    help="seconds to wait for login/2FA/CAPTCHA to complete")
+    ap.add_argument("--timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
+                    help="seconds to wait for login/2FA/CAPTCHA to complete "
+                         f"(default {DEFAULT_LOGIN_TIMEOUT})")
+    ap.add_argument("--session-file", default=".rocketreach-auth.json",
+                    help="reuse signed-in browser state (contains sensitive "
+                         "cookies; default .rocketreach-auth.json)")
+    ap.add_argument("--fresh-login", action="store_true",
+                    help="ignore any saved session and perform a fresh login")
     ap.add_argument("--debug", action="store_true",
                     help="print per-card scan verdicts while searching firms")
     ap.add_argument("--dump-selectors", action="store_true",
@@ -536,7 +714,9 @@ def main():
     if args.dump_selectors:
         dump_selectors(email, password, args.headful, timeout=args.timeout)
         return
-    if not email or not password:
+    usable_session = (args.session_file and os.path.isfile(args.session_file)
+                      and not args.fresh_login)
+    if (not email or not password) and not usable_session:
         sys.exit("set ROCKETREACH_EMAIL/ROCKETREACH_PASSWORD (or --email/--password)")
     run(args)
 

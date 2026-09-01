@@ -5,6 +5,63 @@ import pandas as pd
 
 import rocketreach_web as rw
 
+
+class StateLocator:
+    def __init__(self, visible=False, text=""):
+        self._visible = visible
+        self._text = text
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return int(self._visible)
+
+    def is_visible(self):
+        return self._visible
+
+    def inner_text(self, **_kwargs):
+        return self._text
+
+
+class StatePage:
+    def __init__(self, url, title="RocketReach", body="", password=False,
+                 marker=False):
+        self.url = url
+        self._title = title
+        self._body = body
+        self._password = password
+        self._marker = marker
+
+    def title(self):
+        return self._title
+
+    def locator(self, selector):
+        if selector == "body":
+            return StateLocator(True, self._body)
+        if selector == rw.SEL["logged_in_marker"]:
+            return StateLocator(self._marker)
+        if selector == rw.SEL["login_password"]:
+            return StateLocator(self._password)
+        return StateLocator()
+
+
+# Login state checks are intentionally independent of RocketReach's nav DOM.
+assert rw._is_logged_in(StatePage("https://rocketreach.co/person"))
+assert rw._is_logged_in(StatePage("https://rocketreach.co/dashboard/new"))
+assert not rw._is_logged_in(StatePage("https://rocketreach.co/login",
+                                      password=True))
+assert "verification code" in rw._login_blocker(StatePage(
+    "https://rocketreach.co/verify", body="Enter the verification code"
+))
+assert "Cloudflare" in rw._login_blocker(StatePage(
+    "https://rocketreach.co/login", title="Just a moment"
+))
+assert "rejected" in rw._login_blocker(StatePage(
+    "https://rocketreach.co/login", body="Incorrect email or password"
+))
+
 rows = [
     {"vc_name": "Acme Ventures", "website": "https://www.acme.vc/team"},
     {"vc_name": "Acme Venture Capital", "website": "acme.vc"},
@@ -72,6 +129,9 @@ class FakeContext:
     def new_page(self, *a, **k):
         return object()
 
+    def close(self, *a, **k):
+        return None
+
 
 class FakeSyncPlaywright:
     def __enter__(self):
@@ -90,7 +150,8 @@ rw.reveal_email = fake_reveal
 rw.sync_playwright = lambda: FakeSyncPlaywright()
 
 
-def fake_login(page, email, password, headful, timeout=120):
+def fake_login(page, email, password, headful,
+               timeout=rw.DEFAULT_LOGIN_TIMEOUT):
     assert email and password
     print("fake login ok")
 
@@ -107,7 +168,9 @@ class FakeArgs:
     headful = False
     plan = False
     debug = False
-    timeout = 120
+    timeout = rw.DEFAULT_LOGIN_TIMEOUT
+    session_file = ""
+    fresh_login = False
 
 
 rw.run(args=FakeArgs())
