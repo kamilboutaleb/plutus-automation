@@ -376,14 +376,14 @@ def login(page, email, password, headful, timeout=120):
                        "to complete any verification manually")
 
 
-def dump_selectors(email, password, headful):
+def dump_selectors(email, password, headful, timeout=120):
     """Navigate the live site and print its structure to discover selectors."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headful)
         ctx = browser.new_context()
         page = ctx.new_page()
         try:
-            login(page, email, password, headful)
+            login(page, email, password, headful, timeout=timeout)
         except RuntimeError as e:
             print("login error:", e)
             if headful:
@@ -466,7 +466,7 @@ def run(args):
         ctx = browser.new_context()
         page = ctx.new_page()
         print("logging in…")
-        login(page, email, password, args.headful)
+        login(page, email, password, args.headful, timeout=args.timeout)
         print("logged in")
         for i, firm in enumerate(firms, 1):
             label = firm["vc_name"] or firm["normalized_domain"]
@@ -522,6 +522,8 @@ def main():
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
     ap.add_argument("--plan", action="store_true",
                     help="print the plan and exit (no login/browser)")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="seconds to wait for login/2FA/CAPTCHA to complete")
     ap.add_argument("--debug", action="store_true",
                     help="print per-card scan verdicts while searching firms")
     ap.add_argument("--dump-selectors", action="store_true",
@@ -532,7 +534,7 @@ def main():
     email = args.email or os.environ.get("ROCKETREACH_EMAIL", "").strip()
     password = args.password or os.environ.get("ROCKETREACH_PASSWORD", "").strip()
     if args.dump_selectors:
-        dump_selectors(email, password, args.headful)
+        dump_selectors(email, password, args.headful, timeout=args.timeout)
         return
     if not email or not password:
         sys.exit("set ROCKETREACH_EMAIL/ROCKETREACH_PASSWORD (or --email/--password)")
