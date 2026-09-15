@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 
@@ -33,6 +34,8 @@ PERSON_URL = "https://rocketreach.co/person"
 SCAN_PAGE_SIZE = 10
 MAX_SCAN_CARDS = 30
 DEFAULT_LOGIN_TIMEOUT = 15
+DEFAULT_REVEAL_TIMEOUT = 15.0
+REVEAL_POLL_INTERVAL = 0.5
 
 # Selectors are centralised here because RocketReach's DOM is not a public,
 # stable API. They were verified against the live site when this file was
@@ -84,16 +87,37 @@ BAD_CREDENTIAL_SIGNS = (
     "incorrect email", "incorrect password", "invalid credentials",
     "email or password is incorrect", "wrong password",
 )
+DAILY_SEARCH_LIMIT_SIGNS = (
+    "you've reached your daily search limit",
+    "you have reached your daily search limit",
+    "daily search limit reached",
+    "reached your daily search limit",
+)
+
+
+class DailySearchLimitError(RuntimeError):
+    """Raised when RocketReach blocks further searches for the account."""
 
 
 def _text(el):
     if el is None:
         return ""
-    return clean_text(el.inner_text())
+    try:
+        return clean_text(el.inner_text(timeout=5000))
+    except Exception:
+        # RocketReach re-renders result cards while Playwright is reading them.
+        # A vanished field should discard that card, not abort the whole run.
+        return ""
 
 
 def extract_card(page, card):
     """Extract name/title/employer/email from one result card element."""
+    try:
+        profile_card_id = clean_text(
+            card.get_attribute("data-profile-card-id", timeout=5000)
+        )
+    except Exception:
+        profile_card_id = ""
     name = _text(card.locator(SEL["card_name"]).first) or ""
     title = _text(card.locator(SEL["card_title"]).first) or ""
     if not title:
@@ -115,6 +139,7 @@ def extract_card(page, card):
             email = v.lower()
             break
     return {
+        "profile_card_id": profile_card_id,
         "name": name,
         "current_title": title,
         "current_employer": emp,
@@ -122,10 +147,13 @@ def extract_card(page, card):
     }
 
 
-def enrich_firm(page, firm, headful, delay, debug=False):
+def enrich_firm(page, firm, headful, delay,
+                reveal_timeout=DEFAULT_REVEAL_TIMEOUT, debug=False):
     result_rows = []
     try:
         candidates, note = find_candidates(page, firm, headful, delay, debug=debug)
+    except DailySearchLimitError:
+        raise
     except RuntimeError as e:
         return [], "api_error", str(e)
 
@@ -160,13 +188,16 @@ def enrich_firm(page, firm, headful, delay, debug=False):
             "notes": "",
         }
         if not email:
-            revealed = reveal_email(page, cand["card"], headful)
+            revealed, reveal_note = reveal_candidate_email(
+                page, cand, headful, delay, reveal_timeout
+            )
             if revealed and EMAIL_RE.fullmatch(revealed):
                 row["primary_email"] = revealed
                 row["lookup_status"] = "complete"
             else:
                 row["lookup_status"] = "found_no_email"
-                row["notes"] = "no email shown on RocketReach card"
+                row["notes"] = (reveal_note or
+                                "no email shown on RocketReach card")
 
         conf = 0.4 + (0.2 if prio <= 2 else 0.1 if prio <= 4 else 0.0)
         core = firm["normalized_domain"].split(".")[0]
@@ -178,6 +209,10 @@ def enrich_firm(page, firm, headful, delay, debug=False):
         row["confidence"] = round(min(conf, 0.99), 2)
         result_rows.append(row)
         picked += 1
+    if not result_rows:
+        return [], "api_error", (
+            "role-matching cards disappeared before they could be recorded"
+        )
     return result_rows, "", ""
 
 
@@ -191,8 +226,10 @@ def _person_url_for_company(page, firm, headful, delay):
     query = firm["normalized_domain"] or firm["vc_name"]
     page.goto(f"{COMPANY_URL}?domain={urllib.parse.quote(query)}",
               wait_until="domcontentloaded")
+    _raise_if_daily_search_limit(page)
     for _ in range(8):
         time.sleep(delay + 2.0)
+        _raise_if_daily_search_limit(page)
         if pg_title_ok(page):
             break
     btn = page.locator(SEL["company_search_employees"]).first
@@ -200,8 +237,10 @@ def _person_url_for_company(page, firm, headful, delay):
         btn.wait_for(state="visible", timeout=45000)
         btn.click(timeout=10000)
     except Exception:
+        _raise_if_daily_search_limit(page)
         return None, "company not found on RocketReach"
     time.sleep(delay + 2.0)
+    _raise_if_daily_search_limit(page)
     return page.url, ""
 
 
@@ -238,8 +277,10 @@ def _advance_page_start(url, step):
 
 def _open_results(page, url, delay):
     page.goto(url, wait_until="domcontentloaded")
+    _raise_if_daily_search_limit(page)
     for _ in range(8):
         time.sleep(delay + 2.0)
+        _raise_if_daily_search_limit(page)
         if pg_title_ok(page):
             break
     try:
@@ -247,7 +288,7 @@ def _open_results(page, url, delay):
             state="visible", timeout=30000
         )
     except Exception:
-        pass
+        _raise_if_daily_search_limit(page)
 
 
 def find_candidates(page, firm, headful, delay, debug=False):
@@ -273,6 +314,7 @@ def find_candidates(page, firm, headful, delay, debug=False):
         cards = page.locator(SEL["result_card"])
         count = cards.count()
         if first_page and count == 0:
+            _raise_if_daily_search_limit(page)
             return [], "no people found for firm on RocketReach"
         first_page = False
 
@@ -303,7 +345,9 @@ def find_candidates(page, firm, headful, delay, debug=False):
             if not allowed:
                 continue
             data["prio"] = prio
-            data["card"] = card
+            # Never retain a live Locator. It becomes stale or can point at a
+            # different person after pagination or an email reveal re-render.
+            data["result_url"] = url
             data["employer_domain"] = normalize_domain(
                 data["current_employer"] or ""
             )
@@ -319,40 +363,131 @@ def find_candidates(page, firm, headful, delay, debug=False):
     return cands, "no role-matching people on RocketReach"
 
 
-def reveal_email(page, card, headful):
-    """Click 'Get Contact Info' on a card and return the revealed email."""
-    btn = None
+def _find_card_by_id(page, profile_card_id):
+    """Resolve a fresh card Locator from RocketReach's stable profile ID."""
+    if not profile_card_id:
+        return None
+    cards = page.locator(SEL["result_card"])
     try:
-        btn = card.locator(SEL["reveal_button"]).first
-        if btn.count() == 0:
-            btn = None
+        count = cards.count()
     except Exception:
-        btn = None
-    if btn is None:
+        return None
+    for i in range(count):
+        card = cards.nth(i)
         try:
-            btn = page.locator(SEL["reveal_button"]).first
-            if btn.count() == 0:
-                btn = None
+            current_id = clean_text(
+                card.get_attribute("data-profile-card-id", timeout=5000)
+            )
         except Exception:
-            btn = None
-    if btn is not None:
-        try:
-            btn.click(timeout=8000)
-            time.sleep(2.0)
-        except Exception:
-            pass
-    # After reveal, the card gets an email link with data-testid.
+            continue
+        if current_id == profile_card_id:
+            return card
+    return None
+
+
+def _person_name_key(value):
+    return " ".join(clean_text(value).casefold().split())
+
+
+def reveal_candidate_email(page, candidate, headful, delay,
+                           reveal_timeout=DEFAULT_REVEAL_TIMEOUT):
+    """Re-open and identity-check a candidate before spending a lookup."""
+    profile_card_id = clean_text(candidate.get("profile_card_id"))
+    result_url = clean_text(candidate.get("result_url"))
+    expected_name = clean_text(candidate.get("name"))
+    if not profile_card_id or not result_url:
+        return "", "email not revealed: stable RocketReach card ID unavailable"
+
+    _open_results(page, result_url, delay)
+    card = _find_card_by_id(page, profile_card_id)
+    if card is None:
+        return "", "email not revealed: candidate card disappeared"
+
+    fresh = extract_card(page, card)
+    if (_person_name_key(fresh.get("name")) !=
+            _person_name_key(expected_name)):
+        return "", "email not revealed: candidate identity changed"
+    if fresh.get("email") and EMAIL_RE.fullmatch(fresh["email"]):
+        return fresh["email"].lower(), ""
+
+    email = reveal_email(
+        page, card, headful, profile_card_id=profile_card_id,
+        reveal_timeout=reveal_timeout,
+    )
+    if email:
+        return email, ""
+    return "", "no email shown on RocketReach card"
+
+
+def _email_from_card(card):
+    """Read an email already rendered on one verified profile card."""
     try:
-        email_links = card.locator("a[data-testid='email-phone-text-desktop'], "
-                                   "a[data-testid='email-phone-text-mobile']")
-        n = email_links.count()
-        for i in range(n):
-            v = _text(email_links.nth(i))
-            if EMAIL_RE.fullmatch(v):
-                return v.lower()
+        email_links = card.locator(
+            "a[data-testid='email-phone-text-desktop'], "
+            "a[data-testid='email-phone-text-mobile']"
+        )
+        count = email_links.count()
     except Exception:
-        pass
+        return ""
+    for i in range(count):
+        link = email_links.nth(i)
+        try:
+            href = clean_text(link.get_attribute("href", timeout=1000))
+        except Exception:
+            href = ""
+        values = [_text(link)]
+        if href.lower().startswith("mailto:"):
+            values.append(href[7:].split("?", 1)[0])
+        for value in values:
+            value = clean_text(value).lower()
+            if EMAIL_RE.fullmatch(value):
+                return value
     return ""
+
+
+def reveal_email(page, card, headful, profile_card_id="",
+                 reveal_timeout=DEFAULT_REVEAL_TIMEOUT,
+                 poll_interval=REVEAL_POLL_INTERVAL):
+    """Click once, then poll the same verified card for its email."""
+    timeout = max(float(reveal_timeout), 0.0)
+    interval = max(float(poll_interval), 0.01)
+    deadline = time.monotonic() + timeout
+    clicked = False
+
+    while True:
+        if profile_card_id:
+            card = _find_card_by_id(page, profile_card_id) or card
+
+        email = _email_from_card(card)
+        if email:
+            return email
+
+        if not clicked:
+            try:
+                btn = card.locator(SEL["reveal_button"]).first
+                if btn.count() == 0:
+                    btn = None
+            except Exception:
+                btn = None
+            if btn is not None:
+                try:
+                    btn.click(timeout=8000)
+                    clicked = True
+                    if headful:
+                        print(f"      reveal clicked — waiting up to "
+                              f"{timeout:g}s for email…")
+                except Exception:
+                    pass
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+
+    # One final read handles an email rendered at the timeout boundary.
+    if profile_card_id:
+        card = _find_card_by_id(page, profile_card_id) or card
+    return _email_from_card(card)
 
 
 def _visible(locator):
@@ -374,6 +509,16 @@ def _body_text(page, limit=1200):
         return clean_text(page.locator("body").inner_text(timeout=3000))[:limit]
     except Exception:
         return ""
+
+
+def _raise_if_daily_search_limit(page):
+    """Stop before a quota page can be mistaken for an empty search."""
+    body = _body_text(page, limit=4000).casefold()
+    if any(sign in body for sign in DAILY_SEARCH_LIMIT_SIGNS):
+        raise DailySearchLimitError(
+            "RocketReach daily search limit reached; wait for the account "
+            "reset, then resume from the saved checkpoint"
+        )
 
 
 def _is_logged_in(page):
@@ -458,6 +603,77 @@ def _save_session(context, path):
         os.chmod(path, 0o600)
     except OSError:
         pass
+
+
+NO_MATCH_COLS = [
+    "vc_name", "website", "normalized_domain", "lookup_status", "notes",
+]
+ERROR_COLS = [
+    "vc_name", "website", "normalized_firm_name", "normalized_domain",
+    "lookup_status", "notes", "attempted_at",
+]
+
+
+def _firm_key(row):
+    """Return the stable key used to decide whether a firm is complete."""
+    domain = clean_text(row.get("normalized_domain"))
+    if domain:
+        return f"domain:{domain.casefold()}"
+    name = clean_text(row.get("normalized_firm_name"))
+    if not name:
+        name = normalize_firm(row.get("vc_name"))
+    return f"name:{name.casefold()}" if name else ""
+
+
+def _records_without_nan(frame):
+    if frame is None or frame.empty:
+        return []
+    return frame.where(pd.notna(frame), "").to_dict("records")
+
+
+def _load_checkpoint(path):
+    """Load resumable contacts, no-matches, and retryable errors."""
+    with pd.ExcelFile(path) as workbook:
+        sheets = set(workbook.sheet_names)
+        contacts = (pd.read_excel(workbook, sheet_name="contacts")
+                    if "contacts" in sheets else pd.DataFrame(columns=FINAL_COLS))
+        no_matches = (pd.read_excel(workbook, sheet_name="no_match_firms")
+                      if "no_match_firms" in sheets else pd.DataFrame())
+        errors = (pd.read_excel(workbook, sheet_name="errors")
+                  if "errors" in sheets else pd.DataFrame())
+    return tuple(_records_without_nan(frame)
+                 for frame in (contacts, no_matches, errors))
+
+
+def _write_checkpoint(path, all_rows, no_matches, errors):
+    """Atomically publish a valid workbook so interruption loses no firm."""
+    output_path = os.path.abspath(path)
+    parent = os.path.dirname(output_path)
+    os.makedirs(parent, exist_ok=True)
+
+    out = pd.DataFrame(all_rows, columns=FINAL_COLS)
+    order = {v: k for k, v in PRIORITY_LABEL.items()}
+    out["_o"] = out["contact_priority"].map(order).fillna(9)
+    out = out.sort_values(["vc_name", "_o"], kind="stable").drop(columns=["_o"])
+    nm = pd.DataFrame(no_matches, columns=NO_MATCH_COLS)
+    err = pd.DataFrame(errors, columns=ERROR_COLS)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(output_path)}.",
+        suffix=".tmp.xlsx", dir=parent,
+    )
+    os.close(fd)
+    try:
+        with pd.ExcelWriter(temp_path) as workbook:
+            out.to_excel(workbook, sheet_name="contacts", index=False)
+            if not nm.empty:
+                nm.to_excel(workbook, sheet_name="no_match_firms", index=False)
+            if not err.empty:
+                err.to_excel(workbook, sheet_name="errors", index=False)
+        os.replace(temp_path, output_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def login(page, email, password, headful, timeout=DEFAULT_LOGIN_TIMEOUT):
@@ -604,6 +820,29 @@ def run(args):
 
     all_rows = []
     no_matches = []
+    errors = []
+    resume = bool(getattr(args, "resume", False))
+    retry_no_match = bool(getattr(args, "retry_no_match", False))
+    retry_missing_emails = bool(
+        getattr(args, "retry_missing_emails", False)
+    )
+    retry_missing_keys = set()
+    if resume and os.path.isfile(args.output):
+        all_rows, no_matches, errors = _load_checkpoint(args.output)
+        completed_rows = all_rows if retry_no_match else all_rows + no_matches
+        completed = {_firm_key(row) for row in completed_rows}
+        if retry_missing_emails:
+            retry_missing_keys = {
+                _firm_key(row) for row in all_rows
+                if not clean_text(row.get("primary_email"))
+            }
+            completed.difference_update(retry_missing_keys)
+        completed.discard("")
+        print(f"resuming {len(completed)} completed firms from {args.output}")
+    else:
+        completed = set()
+        if resume:
+            print(f"no checkpoint found at {args.output}; starting fresh")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headful)
         session_file = str(getattr(args, "session_file", "") or "").strip()
@@ -640,39 +879,102 @@ def run(args):
 
             for i, firm in enumerate(firms, 1):
                 label = firm["vc_name"] or firm["normalized_domain"]
+                firm_key = _firm_key(firm)
+                if firm_key in completed:
+                    print(f"[{i}/{len(firms)}] {label} — checkpoint, skipped")
+                    continue
                 print(f"[{i}/{len(firms)}] {label}")
-                rows, status, note = enrich_firm(
-                    page, firm, args.headful, args.delay, debug=args.debug
-                )
-                if status == "api_error":
+                if retry_no_match:
+                    no_matches = [
+                        row for row in no_matches
+                        if _firm_key(row) != firm_key
+                    ]
+                errors = [row for row in errors if _firm_key(row) != firm_key]
+                try:
+                    rows, status, note = enrich_firm(
+                        page, firm, args.headful, args.delay,
+                        reveal_timeout=getattr(
+                            args, "reveal_timeout", DEFAULT_REVEAL_TIMEOUT
+                        ),
+                        debug=args.debug,
+                    )
+                except DailySearchLimitError as exc:
+                    rows, status, note = [], "daily_search_limit", str(exc)
+                except Exception as exc:
+                    rows, status, note = [], "api_error", (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                if status in {"api_error", "daily_search_limit"}:
                     print(f"    ERROR: {note}")
+                    errors.append({
+                        "vc_name": firm["vc_name"], "website": firm["website"],
+                        "normalized_firm_name": firm["normalized_firm_name"],
+                        "normalized_domain": firm["normalized_domain"],
+                        "lookup_status": status if status == "daily_search_limit"
+                        else "retryable_error", "notes": note,
+                        "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    })
+                    _write_checkpoint(args.output, all_rows, no_matches, errors)
+                    print(f"    checkpoint saved -> {args.output}")
+                    if status == "daily_search_limit":
+                        print("    stopping: no later firms were searched; "
+                              "run again with --resume after the limit resets")
+                        break
                     continue
                 if status == "no_match":
+                    if firm_key in retry_missing_keys:
+                        note = ("missing-email retry found no candidates; "
+                                "prior contacts retained")
+                        errors.append({
+                            "vc_name": firm["vc_name"],
+                            "website": firm["website"],
+                            "normalized_firm_name": firm["normalized_firm_name"],
+                            "normalized_domain": firm["normalized_domain"],
+                            "lookup_status": "retryable_error", "notes": note,
+                            "attempted_at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%S%z"
+                            ),
+                        })
+                        print(f"    ERROR: {note}")
+                        _write_checkpoint(
+                            args.output, all_rows, no_matches, errors
+                        )
+                        print(f"    checkpoint saved -> {args.output}")
+                        continue
                     no_matches.append({
                         "vc_name": firm["vc_name"], "website": firm["website"],
                         "normalized_domain": firm["normalized_domain"],
                         "lookup_status": "no_match", "notes": note,
                     })
+                    completed.add(firm_key)
                     print(f"    no_match ({note})")
+                    _write_checkpoint(args.output, all_rows, no_matches, errors)
+                    print(f"    checkpoint saved -> {args.output}")
                     continue
                 for r in rows:
                     print(f"    {r['contact_priority']:<18} "
                           f"{r['first_name']} {r['last_name']} "
                           f"<{r['primary_email'] or '-'}>")
+                if firm_key in retry_missing_keys:
+                    all_rows = [
+                        row for row in all_rows
+                        if _firm_key(row) != firm_key
+                    ]
+                    no_matches = [
+                        row for row in no_matches
+                        if _firm_key(row) != firm_key
+                    ]
+                    retry_missing_keys.discard(firm_key)
                 all_rows.extend(rows)
+                completed.add(firm_key)
+                _write_checkpoint(args.output, all_rows, no_matches, errors)
+                print(f"    checkpoint saved -> {args.output}")
         finally:
             ctx.close()
             browser.close()
 
+    _write_checkpoint(args.output, all_rows, no_matches, errors)
     out = pd.DataFrame(all_rows, columns=FINAL_COLS)
-    order = {v: k for k, v in PRIORITY_LABEL.items()}
-    out["_o"] = out["contact_priority"].map(order).fillna(9)
-    out = out.sort_values(["vc_name", "_o"], kind="stable").drop(columns=["_o"])
-    nm = pd.DataFrame(no_matches)
-    with pd.ExcelWriter(args.output) as xw:
-        out.to_excel(xw, sheet_name="contacts", index=False)
-        if not nm.empty:
-            nm.to_excel(xw, sheet_name="no_match_firms", index=False)
 
     complete = sum(1 for r in all_rows if r["primary_email"])
     matched = len({r["vc_name"] for r in all_rows})
@@ -690,6 +992,10 @@ def main():
     ap.add_argument("--password", default="")
     ap.add_argument("--delay", type=float, default=1.0,
                     help="seconds between requests")
+    ap.add_argument("--reveal-timeout", type=float,
+                    default=DEFAULT_REVEAL_TIMEOUT,
+                    help="seconds to poll a verified card after one reveal "
+                         f"click (default {DEFAULT_REVEAL_TIMEOUT:g})")
     ap.add_argument("--headful", action="store_true",
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
     ap.add_argument("--plan", action="store_true",
@@ -702,6 +1008,12 @@ def main():
                          "cookies; default .rocketreach-auth.json)")
     ap.add_argument("--fresh-login", action="store_true",
                     help="ignore any saved session and perform a fresh login")
+    ap.add_argument("--resume", action="store_true",
+                    help="load --output and skip firms already checkpointed")
+    ap.add_argument("--retry-no-match", action="store_true",
+                    help="with --resume, research previous no-match firms again")
+    ap.add_argument("--retry-missing-emails", action="store_true",
+                    help="with --resume, revisit firms with blank emails")
     ap.add_argument("--debug", action="store_true",
                     help="print per-card scan verdicts while searching firms")
     ap.add_argument("--dump-selectors", action="store_true",
