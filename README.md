@@ -1,103 +1,44 @@
-# VC Workbook Enrichment
+# Find investor contacts from a list of VC firms
 
-Three independent pipelines, all fully automated:
+This program reads an Excel file of firms and makes a new Excel file with up to three investor contacts per firm. It works on Windows and Mac.
 
-1. **`auto_enrich.py`** — official RocketReach API (needs `ROCKETREACH_API_KEY`)
-2. **`website_enrich.py`** — crawls each VC's own website team pages (no API,
-   no account, no credits)
-3. **`rocketreach_web.py`** — drives RocketReach in a real browser via
-   Playwright, logging in with your account and scraping the People Search UI
-   (no API key)
+## Start here
 
-Both take the same input workbook (`vc_name`, `website` filled) and produce
-the same output format: up to 3 role-verified investor contacts per firm,
-best-ranked first, with full helper columns.
+1. Install [Python 3](https://www.python.org/downloads/) if it is not already installed. On Windows, select **Add python.exe to PATH** during installation. On Mac, accept the default settings.
+2. Start the program:
+   - **Windows:** Double-click **`run.bat`**.
+   - **Mac:** Double-click **`run.command`**. If your Mac blocks it, right-click the file and choose **Open**, then **Open** again.
+   A command window will appear. The first run installs the required packages and needs internet access.
+3. If the program creates `Inputs/START_HERE.xlsx`, open that file in Excel. Add one firm on each new row. Fill in **`vc_name`** and **`website`** (for example, `Example Ventures` and `https://example.com`). Leave `first_name`, `last_name`, and `primary_email` blank. Save and close Excel, then double-click your launcher again. You can also put an existing `.xlsx` file in `Inputs`; its first row must have those five exact column names.
+4. Type the number beside your file and press **Return**. Choose **1** for the simplest method: search public firm websites. No account or paid credits are needed. The program also accepts an `.xlsx` file dragged into the command window.
+5. Wait for **Done**, then open the `Outputs` folder and the named Excel file. Follow the prompt to close the command window.
 
-All three enforce the same behavioral rules (below).
+Your input file is never edited. Each website or API run gets a new result name, so an earlier result is not replaced.
 
-## Quick start
+Keep workbooks in `Inputs` and `Outputs`. The program code stays beside `run.bat` and `run.command`; checks live in `tests`. Older mock workbooks were moved to `tests/archive` on this computer.
 
-    python3 -m venv .venv && .venv/bin/pip install -q pandas openpyxl lxml
+## Other lookup choices
 
-### Option 1: RocketReach API
+- **2 — RocketReach browser:** Requires a RocketReach account. Enter your email and password on first use; the password is hidden while you type. A browser opens so you can finish any CAPTCHA or emailed code. Revealing emails may use RocketReach credits. The program asks you to type `YES` before starting. If you stop midway, run it again and choose **Continue** to use its saved progress. A saved sign-in is kept in `.rocketreach-auth.json` on this computer; treat that file like a password.
+- **3 — RocketReach API:** Requires a RocketReach API key. The program shows a free plan first and asks you to type `YES` before spending lookup credits.
 
-    export ROCKETREACH_API_KEY="your_key"
-    .venv/bin/python auto_enrich.py --input <file>.xlsx          # dry-run plan
-    .venv/bin/python auto_enrich.py --input <file>.xlsx --go     # spends credits
+The browser method may stop when RocketReach changes its website or reaches a daily search limit. If it reports a daily limit, wait until the limit resets and choose **Continue** on a later run. Any progress already saved remains in `Outputs`.
 
-### Option 2: VC websites only (no API)
+## If something goes wrong
 
-    .venv/bin/python website_enrich.py --input <file>.xlsx
+| Message or problem | What to do |
+| --- | --- |
+| Python 3 is missing | Install it from the link above, then double-click `run.bat` on Windows or `run.command` on Mac again. |
+| Setup failed | Check the internet connection, then double-click your launcher again. |
+| Missing column | Check the first row of your Excel file. The five names in step 3 must be spelled exactly. |
+| No firms to look up | Add at least one `vc_name` under the header row, save, and close Excel. |
+| Browser sign-in times out | Run again, complete the CAPTCHA or emailed code in the browser within five minutes. |
+| File will not open | Use an `.xlsx` Excel workbook, not `.csv` or an older `.xls` file. |
 
-Crawls each firm's domain politely (≤8 pages, same-domain links matching
-team/about/people hints, configurable delay). Extracts names + titles from
-team pages, captures mailto links and de-obfuscates `name [at] domain`
-patterns, filters to investor roles only, ranks by seniority.
+## For people comfortable with the command line
 
-### Option 3: RocketReach via browser (Playwright)
+Run `run.bat` in Command Prompt on Windows or `./run.command` in Terminal on Mac. The entry points remain available directly: `website_enrich.py`, `auto_enrich.py`, and `rocketreach_web.py`; run each with `--help` for its options. Dependencies are in `requirements.txt`.
 
-    .venv/bin/pip install playwright && .venv/bin/playwright install chromium
-    export ROCKETREACH_EMAIL="you@example.com"
-    read -s "ROCKETREACH_PASSWORD?RocketReach password: "; export ROCKETREACH_PASSWORD; echo
-    .venv/bin/python rocketreach_web.py --input <file>.xlsx            # real run
-    .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful  # watch + finish 2FA
-    .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful --timeout 300
-    .venv/bin/python rocketreach_web.py --input <file>.xlsx --plan     # plan only, no login
+The output has a `contacts` sheet and, when needed, a `no_match_firms` sheet. Contact status is `complete` when an email is present, `found_no_email` when a matching investor has no email, and `no_match` when no matching investor was found. The browser method can also save `retryable_error` rows so a later run can resume. The script keeps at most three contacts per firm and does not assign generic inboxes to individuals.
 
-Logs into RocketReach, resolves each firm via the company search (domain,
-else firm name), follows "Search Employees" to the people-search results,
-applies the investor-title filter, then clicks "Get Contact Info" on the top
-role-ranked candidates to reveal and capture emails. `--headful` keeps the
-browser visible — **recommended, often required** because RocketReach sits
-behind a Cloudflare challenge that blocks headless/automated browsers and may
-occasionally ask for manual verification.
-
-> **Calibrating selectors after a RocketReach redesign:** RocketReach's page
-> markup is not a public, stable API. If the scraper stops finding data, run
->     .venv/bin/python rocketreach_web.py --input <file>.xlsx --dump-selectors --headful
-> to print the live page structure, then update the `SEL` dict at the top of
-> `rocketreach_web.py`.
-
-> **Note:** this skips the API and scrapes the web UI. It still uses your
-> account's lookup credits when you reveal emails ("Get Contact Info"), and
-> automation of the site may violate RocketReach's terms of service. Run
-> responsibly and at modest delay (default 1s between requests).
-
-After a successful login, the browser authentication state is saved to
-`.rocketreach-auth.json` and reused on later runs. This avoids presenting
-RocketReach with a completely new session every time. The file contains
-sensitive session cookies, is excluded by `.gitignore`, and is created with
-owner-only permissions. Use `--fresh-login` to ignore it when it expires or
-when you intentionally change accounts. CAPTCHA and emailed-code verification
-remain manual in `--headful` mode; the script only waits for completion. The
-default login timeout is 15 seconds; use `--timeout 300` when manual
-verification needs longer.
-
-## What all pipelines enforce
-
-- Roles kept: managing/general/founding partner, partner, venture partner,
-  principal, investment manager, investment team, senior/investment associate
-- Roles rejected: founders-only profiles, analysts, interns, operations,
-  finance, legal, marketing, recruiting, engineering
-- Generic inboxes (info@, contact@, …) never attributed to individuals
-- Max 3 contacts per firm; one contact per row; near-duplicate firms merged
-- Output: sheet `contacts` + sheet `no_match_firms`
-
-Columns written: `first_name`, `last_name`, `primary_email`,
-`normalized_firm_name`, `normalized_domain`, `contact_title`,
-`contact_priority`, `source`, `confidence`, `lookup_status`, `notes`.
-
-Statuses: `complete` (email verified/present), `found_no_email` (strong
-contact, no email available — kept for manual follow-up), `no_match`.
-
-## Tests (mocked, no network, no credits)
-
-    .venv/bin/python mock_test.py            # API pipeline
-    .venv/bin/python mock_test_website.py    # website pipeline
-    .venv/bin/python mock_test_rrweb.py      # RocketReach web pipeline
-
-## Notes
-
-- RR endpoint paths are constants at the top of `auto_enrich.py`.
-- Website crawling respects same-domain boundaries and rate-limits itself;
-  review robots.txt of target sites for compliance-sensitive use.
+Local checks (no paid lookups): `.venv/bin/python -m unittest discover -s tests -p 'test_*.py'`, then `.venv/bin/python tests/check_api.py`, `.venv/bin/python tests/check_website.py`, and `.venv/bin/python tests/check_rocketreach.py`. The mock checks use temporary workbooks, so they do not add files to the repository root.

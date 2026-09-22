@@ -1,5 +1,13 @@
+import atexit
 import os
+from pathlib import Path
 import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+scratch = tempfile.TemporaryDirectory(prefix="vc-rocketreach-check-")
+atexit.register(scratch.cleanup)
+os.chdir(scratch.name)
 
 import pandas as pd
 
